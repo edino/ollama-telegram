@@ -9,6 +9,16 @@ import traceback
 import io
 import base64
 import sqlite3
+
+# --- [CUSTOM SEARXNG INJECTION START] ---
+import os
+import aiohttp # Required for asynchronous web requests so the bot doesn't freeze
+import logging
+
+# Define the SearXNG internal gateway. Defaults to your local docker network address.
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080/search")
+# --- [CUSTOM SEARXNG INJECTION END] ---
+
 bot = Bot(token=token)
 dp = Dispatcher()
 start_kb = InlineKeyboardBuilder()
@@ -315,20 +325,77 @@ async def delete_model_confirm_handler(query: types.CallbackQuery):
     else:
         await query.answer(f"Failed to delete model: {modelname}")
 
+# --- [CUSTOM SEARXNG INJECTION START] ---
+async def fetch_web_context(query: str) -> str:
+    """
+    Fetches live search results from the internal SearXNG container.
+    Returns a formatted string containing the top 3 search snippets.
+    """
+    try:
+        # aiohttp is used here to ensure the bot continues listening to other 
+        # Telegram messages while waiting for SearXNG to respond.
+        async with aiohttp.ClientSession() as session:
+            async with session.get(SEARXNG_URL, params={"q": query, "format": "json"}) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    # Parse the JSON and extract the 'content' field from the top 3 results
+                    snippets = [res.get('content', '') for res in data.get('results', [])[:3]]
+                    return "\n---\n".join(snippets)
+    except Exception as e:
+        print(f"SearXNG Connection Error: {e}")
+    return ""
+
 @dp.message()
 @perms_allowed
 async def handle_message(message: types.Message):
+    """
+    Main message handler. Intercepts standard chat messages, checks for 
+    the 'Search' keyword, and performs RAG injection if requested.
+    """
     await get_bot_info()
     
+    # 1. Safely extract text from the message (accounting for photos with captions)
+    user_text = message.text or message.caption or ""
+    web_context = ""
+    search_query = ""
+    
+    # 2. Intercept "Search" command (case-insensitive)
+    if user_text.lower().startswith("search "):
+        # Remove the word "search " from the query string
+        search_query = user_text[7:].strip()
+        
+        # Give immediate feedback to the user on Telegram
+        await bot.send_message(message.chat.id, f"🔍 Searching the live web for: {search_query}...")
+        
+        # Trigger the async SearXNG fetch
+        web_context = await fetch_web_context(search_query)
+
+    # 3. Process Private Chats
     if message.chat.type == "private":
-        await ollama_request(message)
+        prompt = user_text
+        
+        if web_context:
+            # If search was successful, wrap the prompt in RAG context
+            prompt = f"Based on this live web data:\n{web_context}\n\nAnswer the user: {search_query}"
+        elif search_query: 
+            # If search was triggered but returned nothing (or SearXNG is down)
+            prompt = f"Search failed. Answer this without web context: {search_query}"
+            
+        # Pass the formatted prompt to the standard Ollama request function
+        await ollama_request(message, prompt=prompt)
         return
 
+    # 4. Process Group/Supergroup Chats
     if await is_mentioned_in_group_or_supergroup(message):
         thread = await collect_message_thread(message)
         prompt = format_thread_for_prompt(thread)
         
+        # If in a group and web search was requested, append the context to the thread history
+        if web_context:
+            prompt = f"Based on this live web data:\n{web_context}\n\n{prompt}"
+            
         await ollama_request(message, prompt)
+# --- [CUSTOM SEARXNG INJECTION END] ---
 
 async def is_mentioned_in_group_or_supergroup(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
